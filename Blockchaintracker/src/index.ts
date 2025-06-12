@@ -3,12 +3,33 @@ import * as bs58 from 'bs58';
 import * as fs from 'fs';
 import * as path from 'path';
 
-// Owner activity tracking
-const ownerActivity = new Map<string, number[]>(); // owner -> array of timestamps
-const blacklistedOwners = new Set<string>();
-const BLACKLIST_FILE = path.join(__dirname, 'blacklisted_owners.json');
+// Account key activity tracking
+const accountKeyActivity = new Map<string, number[]>(); // accountKey -> array of timestamps
+const blacklistedAccountKeys = new Set<string>();
+const BLACKLIST_FILE = path.join(__dirname, 'blacklisted_account_keys.json');
+
 const MAX_TRANSACTIONS_PER_PERIOD = 40;
 const TIME_WINDOW = 3600000; // 1 hour
+const startupTime = Date.now();
+
+// Concurrent processing configuration
+const MAX_CONCURRENT_PROCESSING = 10;
+const processingQueue: Array<() => Promise<void>> = [];
+let activeProcessing = 0;
+
+// Excluded account keys (system programs)
+const EXCLUDED_ACCOUNT_KEYS = new Set([
+    '11111111111111111111111111111111',
+    'ComputeBudget111111111111111111111111111111',
+    'SysvarRent111111111111111111111111111111111',
+    'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+    'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
+    "SysvarRecentB1ockHashes11111111111111111111",
+    "So11111111111111111111111111111111111111112",
+    "Sysvar1nstructions1111111111111111111111111",
+    "SysvarC1ock11111111111111111111111111111111"
+]);
 
 // Load blacklist from file
 function loadBlacklist(): void {
@@ -16,35 +37,41 @@ function loadBlacklist(): void {
         if (fs.existsSync(BLACKLIST_FILE)) {
             const data = fs.readFileSync(BLACKLIST_FILE, 'utf8');
             const blacklist = JSON.parse(data);
-            blacklist.forEach((owner: string) => blacklistedOwners.add(owner));
-            console.log(`Loaded ${blacklistedOwners.size} blacklisted owners`);
+            blacklist.forEach((accountKey: string) => blacklistedAccountKeys.add(accountKey));
+            console.log(`Loaded ${blacklistedAccountKeys.size} blacklisted account keys`);
         }
     } catch (error) {
         console.error('Error loading blacklist:', error);
     }
 }
 
-// Save blacklist to file
-function saveBlacklist(): void {
+// Save blacklist to file (async)
+async function saveBlacklist(): Promise<void> {
     try {
-        const blacklistArray = Array.from(blacklistedOwners);
-        fs.writeFileSync(BLACKLIST_FILE, JSON.stringify(blacklistArray, null, 2));
-        console.log(`Saved ${blacklistArray.length} blacklisted owners`);
+        const blacklistArray = Array.from(blacklistedAccountKeys);
+        await fs.promises.writeFile(BLACKLIST_FILE, JSON.stringify(blacklistArray, null, 2));
     } catch (error) {
         console.error('Error saving blacklist:', error);
     }
 }
 
-// Check if owner should be blacklisted
-function checkAndUpdateOwnerActivity(owner: string): boolean {
-    const now = Date.now();
-    
-    // Get or create activity array for this owner
-    if (!ownerActivity.has(owner)) {
-        ownerActivity.set(owner, []);
+
+
+// Check if account key should be blacklisted or unblacklisted
+async function checkAndUpdateAccountKeyActivity(accountKey: string): Promise<boolean> {
+    // Skip excluded system programs
+    if (EXCLUDED_ACCOUNT_KEYS.has(accountKey)) {
+        return false;
     }
     
-    const timestamps = ownerActivity.get(owner)!;
+    const now = Date.now();
+    
+    // Get or create activity array for this account key
+    if (!accountKeyActivity.has(accountKey)) {
+        accountKeyActivity.set(accountKey, []);
+    }
+    
+    const timestamps = accountKeyActivity.get(accountKey)!;
     
     // Remove timestamps older than the time window
     const recentTimestamps = timestamps.filter(timestamp => now - timestamp < TIME_WINDOW);
@@ -53,17 +80,62 @@ function checkAndUpdateOwnerActivity(owner: string): boolean {
     recentTimestamps.push(now);
     
     // Update the activity record
-    ownerActivity.set(owner, recentTimestamps);
+    accountKeyActivity.set(accountKey, recentTimestamps);
     
-    // Check if owner should be blacklisted
-    if (recentTimestamps.length > MAX_TRANSACTIONS_PER_PERIOD && !blacklistedOwners.has(owner)) {
-        blacklistedOwners.add(owner);
-        saveBlacklist();
-        console.log(`Owner ${owner} blacklisted for excessive activity (${recentTimestamps.length} transactions in ${TIME_WINDOW/1000}s)`);
+    // Check if account key should be unblacklisted (only after startup time window has elapsed)
+    const timeElapsedSinceStartup = now - startupTime;
+    if (blacklistedAccountKeys.has(accountKey) && 
+        recentTimestamps.length <= MAX_TRANSACTIONS_PER_PERIOD && 
+        timeElapsedSinceStartup >= TIME_WINDOW) {
+        blacklistedAccountKeys.delete(accountKey);
+        await saveBlacklist();
+        console.log(`Account key ${accountKey} unblacklisted - recent activity below threshold (${recentTimestamps.length} transactions in ${TIME_WINDOW/1000}s)`);
+        return false;
+    }
+    
+    // Check if account key should be blacklisted
+    if (recentTimestamps.length > MAX_TRANSACTIONS_PER_PERIOD && !blacklistedAccountKeys.has(accountKey)) {
+        blacklistedAccountKeys.add(accountKey);
+        await saveBlacklist();
         return true;
     }
     
-    return blacklistedOwners.has(owner);
+    return blacklistedAccountKeys.has(accountKey);
+}
+
+// Process queue worker
+async function processQueue(): Promise<void> {
+    while (processingQueue.length > 0 && activeProcessing < MAX_CONCURRENT_PROCESSING) {
+        const task = processingQueue.shift();
+        if (task) {
+            activeProcessing++;
+            task().finally(() => {
+                activeProcessing--;
+                // Continue processing queue if there are more tasks
+                if (processingQueue.length > 0) {
+                    setImmediate(() => processQueue());
+                }
+            });
+        }
+    }
+}
+
+// Add task to queue
+function enqueueTransaction(data: any): void {
+    const task = async () => {
+        try {
+            await processTransaction(data);
+        } catch (error) {
+            console.error('Error processing transaction:', error);
+        }
+    };
+    
+    processingQueue.push(task);
+    
+    // Start processing if not at capacity
+    if (activeProcessing < MAX_CONCURRENT_PROCESSING) {
+        setImmediate(() => processQueue());
+    }
 }
 
 class GrpcStreamManager {
@@ -222,35 +294,21 @@ async function monitorTransactions() {
     await manager.connect(subscribeRequest);
 }
 
+// Non-blocking handler that queues transactions for processing
 function handleTransactionUpdate(data: any): void {
+    enqueueTransaction(data);
+}
+
+// Async transaction processor
+async function processTransaction(data: any): Promise<void> {
     // Check if we have transaction data in the correct structure
     if (data?.transaction?.transaction) {
         const txInfo = data.transaction.transaction;
         
-        // First filter: Check if any token balance owners are blacklisted
-        const allOwners = new Set<string>();
-        
-        // Collect all owners from pre and post token balances
-        if (txInfo.meta.preTokenBalances) {
-            txInfo.meta.preTokenBalances.forEach((balance: any) => {
-                if (balance.owner) {
-                    allOwners.add(balance.owner);
-                }
-            });
-        }
-        
-        if (txInfo.meta.postTokenBalances) {
-            txInfo.meta.postTokenBalances.forEach((balance: any) => {
-                if (balance.owner) {
-                    allOwners.add(balance.owner);
-                }
-            });
-        }
-        
-        // Check if any owner is blacklisted (and update activity)
-        for (const owner of allOwners) {
-            if (checkAndUpdateOwnerActivity(owner)) {
-                return; // Skip transaction if any owner is blacklisted
+        // Check if any account key is blacklisted (and update activity)
+        for (const accountKey of txInfo.transaction.message.accountKeys) {
+            if (await checkAndUpdateAccountKeyActivity(accountKey)) {
+                return; // Skip transaction if any account key is blacklisted
             }
         }
         
@@ -318,13 +376,12 @@ function handleTransactionUpdate(data: any): void {
                         console.log(`  Amount Received: ${amountReceived.toFixed(6)} USDC`);
                         console.log(`  Sender's Remaining Balance: ${senderRemainingBalance.toFixed(6)} USDC`);
                         console.log(`  Discrepancy: ${(discrepancy * 100).toFixed(2)}%`);
+                        //print all accountkeys in the transaction
+                        console.log(txInfo.transaction.message.accountKeys);
                     }
                 } else {
                     console.log("Could not identify proper sender/receiver pair");
                 }
-                
-                //print all accountkeys in the transaction
-                console.log(txInfo.transaction.message.accountKeys);
             }
         }
             // Log messages
