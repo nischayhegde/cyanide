@@ -7,7 +7,7 @@ import * as path from 'path';
 const ownerActivity = new Map<string, number[]>(); // owner -> array of timestamps
 const blacklistedOwners = new Set<string>();
 const BLACKLIST_FILE = path.join(__dirname, 'blacklisted_owners.json');
-const MAX_TRANSACTIONS_PER_PERIOD = 20;
+const MAX_TRANSACTIONS_PER_PERIOD = 40;
 const TIME_WINDOW = 3600000; // 1 hour
 
 // Load blacklist from file
@@ -226,6 +226,34 @@ function handleTransactionUpdate(data: any): void {
     // Check if we have transaction data in the correct structure
     if (data?.transaction?.transaction) {
         const txInfo = data.transaction.transaction;
+        
+        // First filter: Check if any token balance owners are blacklisted
+        const allOwners = new Set<string>();
+        
+        // Collect all owners from pre and post token balances
+        if (txInfo.meta.preTokenBalances) {
+            txInfo.meta.preTokenBalances.forEach((balance: any) => {
+                if (balance.owner) {
+                    allOwners.add(balance.owner);
+                }
+            });
+        }
+        
+        if (txInfo.meta.postTokenBalances) {
+            txInfo.meta.postTokenBalances.forEach((balance: any) => {
+                if (balance.owner) {
+                    allOwners.add(balance.owner);
+                }
+            });
+        }
+        
+        // Check if any owner is blacklisted (and update activity)
+        for (const owner of allOwners) {
+            if (checkAndUpdateOwnerActivity(owner)) {
+                return; // Skip transaction if any owner is blacklisted
+            }
+        }
+        
         // Filter: Only process transactions which are a simple transfer of USDC. We can check if the transaction is a simple transfer of USDC by checking if the number of pre and post token balances are both less than or equal to 2 and all of the token mints are usdc. There must be at least one pre and one post token balance.
         const USDCMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
         
@@ -268,14 +296,6 @@ function handleTransactionUpdate(data: any): void {
                         receiver = owner;
                         amountReceived = change;
                     }
-                }
-                
-                // Check if sender or receiver are blacklisted (and update activity)
-                const senderBlacklisted = checkAndUpdateOwnerActivity(sender);
-                const receiverBlacklisted = checkAndUpdateOwnerActivity(receiver);
-                
-                if (senderBlacklisted || receiverBlacklisted) {
-                    return;
                 }
                 
                 // Check if amounts are within 4% tolerance
