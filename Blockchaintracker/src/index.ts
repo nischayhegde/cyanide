@@ -2,6 +2,7 @@ import Client, { CommitmentLevel, SubscribeRequest } from "@triton-one/yellowsto
 import * as bs58 from 'bs58';
 import * as fs from 'fs';
 import * as path from 'path';
+import axios from 'axios';
 
 // Account key activity tracking
 const accountKeyActivity = new Map<string, number[]>(); // accountKey -> array of timestamps
@@ -257,6 +258,21 @@ class GrpcStreamManager {
         }
         return obj;
     }
+
+    // Add a method to refresh the gRPC connection
+    async refreshConnection(subscribeRequest: SubscribeRequest): Promise<void> {
+        try {
+            if (this.stream) {
+                this.stream.removeAllListeners();
+                this.stream.end();
+                this.isConnected = false;
+            }
+            await this.connect(subscribeRequest);
+            console.log("gRPC connection refreshed.");
+        } catch (error) {
+            console.error("Error refreshing gRPC connection:", error);
+        }
+    }
 }
 
 // Transaction monitoring implementation
@@ -292,6 +308,11 @@ async function monitorTransactions() {
     };
 
     await manager.connect(subscribeRequest);
+
+    // Refresh the gRPC connection every 15 minutes
+    setInterval(() => {
+        manager.refreshConnection(subscribeRequest);
+    }, 15 * 60 * 1000);
 }
 
 // Non-blocking handler that queues transactions for processing
@@ -376,6 +397,11 @@ async function processTransaction(data: any): Promise<void> {
                         console.log(`  Amount Received: ${amountReceived.toFixed(6)} USDC`);
                         console.log(`  Sender's Remaining Balance: ${senderRemainingBalance.toFixed(6)} USDC`);
                         console.log(`  Discrepancy: ${(discrepancy * 100).toFixed(2)}%`);
+                        console.log("calling poison endpoint on localhost:5001/poison")
+                        axios.post('http://127.0.0.1:5001/poison', {
+                            detectedsender: sender,
+                            detectedreceiver: receiver
+                        });
                         //print all accountkeys in the transaction
                         console.log(txInfo.transaction.message.accountKeys);
                     }

@@ -12,6 +12,7 @@
   "description": "",
   "dependencies": {
     "@triton-one/yellowstone-grpc": "^4.0.0",
+    "axios": "^1.9.0",
     "bs58": "^6.0.0",
     "node-fetch": "^2.7.0"
   },
