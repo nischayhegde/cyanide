@@ -56,36 +56,54 @@ async function saveBlacklist(): Promise<void> {
     }
 }
 
-
+// Periodic sweep to unblacklist eligible account keys
+async function sweepUnblacklist(): Promise<void> {
+    const now = Date.now();
+    const toUnblacklist: string[] = [];
+    for (const accountKey of blacklistedAccountKeys) {
+        const timestamps = accountKeyActivity.get(accountKey) || [];
+        const recentTimestamps = timestamps.filter(timestamp => now - timestamp < TIME_WINDOW);
+        // If activity is below threshold and time window has elapsed since startup, unblacklist
+        if (recentTimestamps.length <= MAX_TRANSACTIONS_PER_PERIOD && (now - startupTime) >= TIME_WINDOW) {
+            toUnblacklist.push(accountKey);
+            console.log(`Account key ${accountKey} unblacklisted by sweep - recent activity below threshold (${recentTimestamps.length} transactions in ${TIME_WINDOW/1000}s)`);
+        }
+        // Update the activity record in case timestamps were trimmed
+        accountKeyActivity.set(accountKey, recentTimestamps);
+    }
+    if (toUnblacklist.length > 0) {
+        toUnblacklist.forEach(key => blacklistedAccountKeys.delete(key));
+        await saveBlacklist();
+    }
+}
 
 // Check if account key should be blacklisted or unblacklisted
 async function checkAndUpdateAccountKeyActivity(accountKey: string): Promise<boolean> {
-    // Skip excluded system programs
+    // Early return for excluded account keys
     if (EXCLUDED_ACCOUNT_KEYS.has(accountKey)) {
         return false;
     }
     
+    // Early return if already blacklisted and no activity update needed
+    const isCurrentlyBlacklisted = blacklistedAccountKeys.has(accountKey);
     const now = Date.now();
     
-    // Get or create activity array for this account key
-    if (!accountKeyActivity.has(accountKey)) {
-        accountKeyActivity.set(accountKey, []);
+    // Get or create activity array
+    let timestamps = accountKeyActivity.get(accountKey);
+    if (!timestamps) {
+        timestamps = [];
+        accountKeyActivity.set(accountKey, timestamps);
     }
     
-    const timestamps = accountKeyActivity.get(accountKey)!;
-    
-    // Remove timestamps older than the time window
+    // Filter recent timestamps and add current one
     const recentTimestamps = timestamps.filter(timestamp => now - timestamp < TIME_WINDOW);
-    
-    // Add current timestamp
     recentTimestamps.push(now);
-    
-    // Update the activity record
     accountKeyActivity.set(accountKey, recentTimestamps);
     
-    // Check if account key should be unblacklisted (only after startup time window has elapsed)
     const timeElapsedSinceStartup = now - startupTime;
-    if (blacklistedAccountKeys.has(accountKey) && 
+    
+    // Check for unblacklisting first (early return if unblacklisted)
+    if (isCurrentlyBlacklisted && 
         recentTimestamps.length <= MAX_TRANSACTIONS_PER_PERIOD && 
         timeElapsedSinceStartup >= TIME_WINDOW) {
         blacklistedAccountKeys.delete(accountKey);
@@ -94,14 +112,14 @@ async function checkAndUpdateAccountKeyActivity(accountKey: string): Promise<boo
         return false;
     }
     
-    // Check if account key should be blacklisted
-    if (recentTimestamps.length > MAX_TRANSACTIONS_PER_PERIOD && !blacklistedAccountKeys.has(accountKey)) {
+    // Check for blacklisting (early return if should be blacklisted)
+    if (recentTimestamps.length > MAX_TRANSACTIONS_PER_PERIOD && !isCurrentlyBlacklisted) {
         blacklistedAccountKeys.add(accountKey);
         await saveBlacklist();
         return true;
     }
     
-    return blacklistedAccountKeys.has(accountKey);
+    return isCurrentlyBlacklisted;
 }
 
 // Process queue worker
@@ -123,6 +141,11 @@ async function processQueue(): Promise<void> {
 
 // Add task to queue
 function enqueueTransaction(data: any): void {
+    // Early return for invalid data
+    if (!data?.transaction?.transaction) {
+        return;
+    }
+    
     const task = async () => {
         try {
             await processTransaction(data);
@@ -140,74 +163,133 @@ function enqueueTransaction(data: any): void {
 }
 
 class GrpcStreamManager {
-    private client: Client;
+    private client!: Client;
     private stream: any;
     private isConnected: boolean = false;
     private reconnectAttempts: number = 0;
-    private readonly maxReconnectAttempts: number = 10;
-    private readonly reconnectInterval: number = 5000; // 5 seconds
+    private readonly maxReconnectAttempts: number = 50; // Increased attempts
+    private readonly baseReconnectInterval: number = 5000; // 5 seconds
     private readonly dataHandler: (data: any) => void;
+    private readonly endpoint: string;
+    private readonly authToken: string;
+    private reconnectTimer: NodeJS.Timeout | null = null;
+    private pingInterval: NodeJS.Timeout | null = null;
+    private isReconnecting: boolean = false;
 
     constructor(
         endpoint: string,
         authToken: string,
         dataHandler: (data: any) => void
     ) {
+        this.endpoint = endpoint;
+        this.authToken = authToken;
+        this.dataHandler = dataHandler;
+        this.createClient();
+    }
+
+    private createClient(): void {
         this.client = new Client(
-            endpoint,
-            authToken,
+            this.endpoint,
+            this.authToken,
             { "grpc.max_receive_message_length": 64 * 1024 * 1024 }
         );
-        this.dataHandler = dataHandler;
     }
 
     async connect(subscribeRequest: SubscribeRequest): Promise<void> {
         try {
+            // Clear any existing timers
+            this.clearTimers();
+            
             this.stream = await this.client.subscribe();
             this.isConnected = true;
             this.reconnectAttempts = 0;
+            this.isReconnecting = false;
 
             this.stream.on("data", this.handleData.bind(this));
-            this.stream.on("error", this.handleError.bind(this));
+            this.stream.on("error", this.handleError.bind(this, subscribeRequest));
             this.stream.on("end", () => this.handleDisconnect(subscribeRequest));
             this.stream.on("close", () => this.handleDisconnect(subscribeRequest));
 
             await this.write(subscribeRequest);
             this.startPing();
+            
+            console.log("gRPC connection established successfully");
         } catch (error) {
             console.error("Connection error:", error);
-            await this.reconnect(subscribeRequest);
+            this.isConnected = false;
+            await this.scheduleReconnect(subscribeRequest);
         }
     }
 
     private async write(req: SubscribeRequest): Promise<void> {
         return new Promise((resolve, reject) => {
+            if (!this.stream) {
+                reject(new Error("Stream not available"));
+                return;
+            }
             this.stream.write(req, (err: any) => err ? reject(err) : resolve());
         });
     }
 
-    private async reconnect(subscribeRequest: SubscribeRequest): Promise<void> {
+    private async scheduleReconnect(subscribeRequest: SubscribeRequest): Promise<void> {
+        if (this.isReconnecting) {
+            return; // Already reconnecting
+        }
+
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.error("Max reconnection attempts reached");
+            console.error(`Max reconnection attempts (${this.maxReconnectAttempts}) reached. Waiting 5 minutes before resetting...`);
+            this.reconnectTimer = setTimeout(() => {
+                this.reconnectAttempts = 0; // Reset attempts
+                this.scheduleReconnect(subscribeRequest);
+            }, 5 * 60 * 1000); // Wait 5 minutes
             return;
         }
 
+        this.isReconnecting = true;
         this.reconnectAttempts++;
-        console.log(`Reconnecting... Attempt ${this.reconnectAttempts}`);
+        
+        // Exponential backoff with jitter
+        const backoffMs = Math.min(
+            this.baseReconnectInterval * Math.pow(2, this.reconnectAttempts - 1),
+            60000 // Max 1 minute
+        );
+        const jitterMs = Math.random() * 1000; // Add up to 1 second jitter
+        const delayMs = backoffMs + jitterMs;
 
-        setTimeout(async () => {
+        console.log(`Reconnecting... Attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts} (delay: ${Math.round(delayMs/1000)}s)`);
+
+        this.reconnectTimer = setTimeout(async () => {
             try {
+                // Recreate client on certain errors (every 5 attempts)
+                if (this.reconnectAttempts % 5 === 0) {
+                    console.log("Recreating gRPC client...");
+                    this.createClient();
+                }
+                
                 await this.connect(subscribeRequest);
             } catch (error) {
                 console.error("Reconnection failed:", error);
-                await this.reconnect(subscribeRequest);
+                this.isReconnecting = false;
+                await this.scheduleReconnect(subscribeRequest);
             }
-        }, this.reconnectInterval * Math.min(this.reconnectAttempts, 5));
+        }, delayMs);
+    }
+
+    private clearTimers(): void {
+        if (this.reconnectTimer) {
+            clearTimeout(this.reconnectTimer);
+            this.reconnectTimer = null;
+        }
+        if (this.pingInterval) {
+            clearInterval(this.pingInterval);
+            this.pingInterval = null;
+        }
     }
 
     private startPing(): void {
-        setInterval(() => {
-            if (this.isConnected) {
+        this.clearTimers();
+        this.pingInterval = setInterval(() => {
+            if (this.isConnected && this.stream) {
                 this.write({
                     ping: { id: 1 },
                     accounts: {},
@@ -218,7 +300,10 @@ class GrpcStreamManager {
                     entry: {},
                     slots: {},
                     transactionsStatus: {},
-                }).catch(console.error);
+                }).catch(error => {
+                    console.error("Ping error:", error);
+                    this.isConnected = false;
+                });
             }
         }, 30000);
     }
@@ -232,15 +317,38 @@ class GrpcStreamManager {
         }
     }
 
-    private handleError(error: any): void {
+    private handleError(subscribeRequest: SubscribeRequest, error: any): void {
         console.error("Stream error:", error);
         this.isConnected = false;
+        
+        // Don't immediately reconnect from error handler to avoid race conditions
+        // Let the disconnect handler manage reconnection
+        if (!this.isReconnecting) {
+            setImmediate(() => this.handleDisconnect(subscribeRequest));
+        }
     }
 
     private handleDisconnect(subscribeRequest: SubscribeRequest): void {
-        console.log("Stream disconnected");
-        this.isConnected = false;
-        this.reconnect(subscribeRequest);
+        if (this.isConnected) {
+            console.log("Stream disconnected");
+            this.isConnected = false;
+        }
+        
+        // Clean up stream
+        if (this.stream) {
+            try {
+                this.stream.removeAllListeners();
+                this.stream.end();
+            } catch (error) {
+                // Ignore errors during cleanup
+            }
+            this.stream = null;
+        }
+        
+        // Schedule reconnection if not already reconnecting
+        if (!this.isReconnecting) {
+            this.scheduleReconnect(subscribeRequest);
+        }
     }
 
     private processBuffers(obj: any): any {
@@ -262,15 +370,46 @@ class GrpcStreamManager {
     // Add a method to refresh the gRPC connection
     async refreshConnection(subscribeRequest: SubscribeRequest): Promise<void> {
         try {
+            console.log("Refreshing gRPC connection...");
+            this.clearTimers();
+            
             if (this.stream) {
                 this.stream.removeAllListeners();
                 this.stream.end();
                 this.isConnected = false;
+                this.stream = null;
             }
+            
+            // Reset reconnection state
+            this.isReconnecting = false;
+            this.reconnectAttempts = 0;
+            
+            // Recreate client
+            this.createClient();
+            
             await this.connect(subscribeRequest);
-            console.log("gRPC connection refreshed.");
+            console.log("gRPC connection refreshed successfully");
         } catch (error) {
             console.error("Error refreshing gRPC connection:", error);
+            this.isConnected = false;
+            await this.scheduleReconnect(subscribeRequest);
+        }
+    }
+
+    // Add cleanup method
+    public cleanup(): void {
+        this.clearTimers();
+        this.isConnected = false;
+        this.isReconnecting = false;
+        
+        if (this.stream) {
+            try {
+                this.stream.removeAllListeners();
+                this.stream.end();
+            } catch (error) {
+                // Ignore cleanup errors
+            }
+            this.stream = null;
         }
     }
 }
@@ -281,7 +420,7 @@ async function monitorTransactions() {
     loadBlacklist();
     
     const manager = new GrpcStreamManager(
-        "http://new-york.grpc.pinnaclenode.com",
+        "http://frankfurt.grpc.pinnaclenode.com",
         "",
         handleTransactionUpdate
     );
@@ -313,6 +452,11 @@ async function monitorTransactions() {
     setInterval(() => {
         manager.refreshConnection(subscribeRequest);
     }, 15 * 60 * 1000);
+
+    // Periodic sweep for unblacklisting every 5 minutes
+    setInterval(() => {
+        sweepUnblacklist().catch(console.error);
+    }, 5 * 60 * 1000);
 }
 
 // Non-blocking handler that queues transactions for processing
@@ -322,103 +466,180 @@ function handleTransactionUpdate(data: any): void {
 
 // Async transaction processor
 async function processTransaction(data: any): Promise<void> {
-    // Check if we have transaction data in the correct structure
-    if (data?.transaction?.transaction) {
-        const txInfo = data.transaction.transaction;
-        
-        // Check if any account key is blacklisted (and update activity)
-        for (const accountKey of txInfo.transaction.message.accountKeys) {
-            if (await checkAndUpdateAccountKeyActivity(accountKey)) {
-                return; // Skip transaction if any account key is blacklisted
+    // Early return for invalid data structure
+    if (!data?.transaction?.transaction) {
+        return;
+    }
+    
+    const txInfo = data.transaction.transaction;
+    const accountKeys = txInfo.transaction?.message?.accountKeys;
+    
+    // Early return if no account keys or invalid structure
+    if (!accountKeys || !Array.isArray(accountKeys)) {
+        return;
+    }
+    
+    // CHECK BLACKLIST FIRST - before any other processing
+    for (const accountKey of accountKeys) {
+        if (await checkAndUpdateAccountKeyActivity(accountKey)) {
+            return; // Skip transaction immediately if any account key is blacklisted
+        }
+    }
+    
+    // Only after blacklist check, do other validations
+    // Early return for complex transactions
+    if (accountKeys.length > 11) {
+        return; // Not a simple transfer - exit immediately
+    }
+    
+    // Early return if no meta data
+    if (!txInfo.meta) {
+        return;
+    }
+    
+    const { preTokenBalances, postTokenBalances } = txInfo.meta;
+    
+    // Early return for invalid token balance structure
+    if (!preTokenBalances || !postTokenBalances || 
+        preTokenBalances.length > 2 || postTokenBalances.length !== 2 || 
+        preTokenBalances.length < 1) {
+        return;
+    }
+    
+    // Early return if not all USDC (short-circuit evaluation)
+    const USDCMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    const allPreAreUSDC = preTokenBalances.every((balance: any) => balance?.mint === USDCMint);
+    const allPostAreUSDC = postTokenBalances.every((balance: any) => balance?.mint === USDCMint);
+    
+    if (!allPreAreUSDC || !allPostAreUSDC) {
+        return;
+    }
+    
+    // Optimized balance calculation with early validation
+    let sender = '';
+    let receiver = '';
+    let amountSent = 0;
+    let amountReceived = 0;
+    
+    // Process balances more efficiently
+    const ownerBalances = new Map<string, number>();
+    
+    // Subtract pre-balances
+    for (const balance of preTokenBalances) {
+        if (!balance?.owner || !balance?.uiTokenAmount?.uiAmountString) continue;
+        const amount = parseFloat(balance.uiTokenAmount.uiAmountString);
+        if (isNaN(amount)) continue;
+        ownerBalances.set(balance.owner, (ownerBalances.get(balance.owner) || 0) - amount);
+    }
+    
+    // Add post-balances
+    for (const balance of postTokenBalances) {
+        if (!balance?.owner || !balance?.uiTokenAmount?.uiAmountString) continue;
+        const amount = parseFloat(balance.uiTokenAmount.uiAmountString);
+        if (isNaN(amount)) continue;
+        ownerBalances.set(balance.owner, (ownerBalances.get(balance.owner) || 0) + amount);
+    }
+    
+    // Find sender and receiver in one pass
+    for (const [owner, change] of ownerBalances.entries()) {
+        if (change < 0 && !sender) {
+            sender = owner;
+            amountSent = Math.abs(change);
+        } else if (change > 0 && !receiver) {
+            receiver = owner;
+            amountReceived = change;
+        }
+        // Early exit if both found
+        if (sender && receiver) break;
+    }
+    
+    // Early return if can't identify sender/receiver
+    if (!sender || !receiver || amountSent <= 0 || amountReceived <= 0) {
+        return;
+    }
+    
+    // Early return for amount threshold
+    if (amountSent < 1) {
+        return;
+    }
+    
+    // Early return for tolerance check
+    const discrepancy = Math.abs(amountSent - amountReceived) / amountSent;
+    if (discrepancy > 0.04) {
+        return;
+    }
+    
+    // Find sender's remaining balance (only if we've passed other checks)
+    const senderPostBalance = postTokenBalances.find((balance: any) => balance.owner === sender);
+    const senderRemainingBalance = senderPostBalance ? parseFloat(senderPostBalance.uiTokenAmount.uiAmountString) : 0;
+    
+    // Early return for balance threshold
+    if (senderRemainingBalance < 100) {
+        return;
+    }
+    
+    // Only log and call API if all conditions are met
+    console.log("Transaction is a simple transfer of USDC");
+    console.log(txInfo.transaction.signatures[0]);
+    console.log(`USDC Transfer Details:`);
+    console.log(`  From: ${sender}`);
+    console.log(`  To: ${receiver}`);
+    console.log(`  Amount Sent: ${amountSent.toFixed(6)} USDC`);
+    console.log(`  Amount Received: ${amountReceived.toFixed(6)} USDC`);
+    console.log(`  Sender's Remaining Balance: ${senderRemainingBalance.toFixed(6)} USDC`);
+    console.log(`  Discrepancy: ${(discrepancy * 100).toFixed(2)}%`);
+    console.log("calling poison endpoint on localhost:5001/poison");
+    
+    // Use async axios call to avoid blocking
+    axios.post('http://127.0.0.1:5001/poison', {
+        detectedsender: sender,
+        detectedreceiver: receiver
+    }).catch(error => console.error('API call failed:', error));
+}
+
+// Global error handlers to prevent crashes
+process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    console.log('Process will continue running...');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    console.log('Process will continue running...');
+});
+
+// Graceful shutdown handler
+process.on('SIGINT', () => {
+    console.log('Received SIGINT, shutting down gracefully...');
+    process.exit(0);
+});
+
+// Start monitoring with retry logic
+async function startMonitoringWithRetry(): Promise<void> {
+    let retryCount = 0;
+    const maxRetries = 10;
+    
+    while (retryCount < maxRetries) {
+        try {
+            console.log(`Starting transaction monitoring... (attempt ${retryCount + 1})`);
+            await monitorTransactions();
+            break; // If successful, break out of retry loop
+        } catch (error) {
+            retryCount++;
+            console.error(`Transaction monitoring failed (attempt ${retryCount}/${maxRetries}):`, error);
+            
+            if (retryCount >= maxRetries) {
+                console.error('Max retries reached. Exiting...');
+                process.exit(1);
             }
+            
+            // Wait before retrying (exponential backoff)
+            const delay = Math.min(5000 * Math.pow(2, retryCount - 1), 60000);
+            console.log(`Retrying in ${delay/1000} seconds...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
         }
-        
-        // Filter: Only process transactions which are a simple transfer of USDC. We can check if the transaction is a simple transfer of USDC by checking if the number of pre and post token balances are both less than or equal to 2 and all of the token mints are usdc. There must be at least one pre and one post token balance.
-        const USDCMint = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-        
-        // Filter out complex transactions with more than 11 account keys
-        if (txInfo.transaction.message.accountKeys.length > 11) {
-            return; // Not a simple transfer
-        }
-        
-        if(txInfo.meta.preTokenBalances.length <= 2 && txInfo.meta.postTokenBalances.length == 2 && txInfo.meta.preTokenBalances.length >= 1) {
-            if(txInfo.meta.preTokenBalances.every((balance: any) => balance.mint == USDCMint) && txInfo.meta.postTokenBalances.every((balance: any) => balance.mint == USDCMint)) {
-                
-                // Calculate balance changes for each owner
-                const balanceChanges = new Map<string, number>();
-                
-                // Process pre-token balances (subtract from owner's balance)
-                txInfo.meta.preTokenBalances.forEach((balance: any) => {
-                    const owner = balance.owner;
-                    const amount = parseFloat(balance.uiTokenAmount.uiAmountString);
-                    balanceChanges.set(owner, (balanceChanges.get(owner) || 0) - amount);
-                });
-                
-                // Process post-token balances (add to owner's balance)
-                txInfo.meta.postTokenBalances.forEach((balance: any) => {
-                    const owner = balance.owner;
-                    const amount = parseFloat(balance.uiTokenAmount.uiAmountString);
-                    balanceChanges.set(owner, (balanceChanges.get(owner) || 0) + amount);
-                });
-                
-                // Find sender (negative change) and receiver (positive change)
-                let sender = '';
-                let receiver = '';
-                let amountSent = 0;
-                let amountReceived = 0;
-                
-                for (const [owner, change] of balanceChanges.entries()) {
-                    if (change < 0) {
-                        sender = owner;
-                        amountSent = Math.abs(change);
-                    } else if (change > 0) {
-                        receiver = owner;
-                        amountReceived = change;
-                    }
-                }
-                
-                // Check if amounts are within 4% tolerance
-                if (sender && receiver && amountSent > 0 && amountReceived > 0) {
-                    const discrepancy = Math.abs(amountSent - amountReceived) / amountSent;
-                    
-                    // Find sender's post-transaction balance
-                    const senderPostBalance = txInfo.meta.postTokenBalances.find((balance: any) => balance.owner === sender);
-                    const senderRemainingBalance = senderPostBalance ? parseFloat(senderPostBalance.uiTokenAmount.uiAmountString) : 0;
-                    
-                    // Filter out transactions where sender's remaining balance is under 100 USDC
-                    
-                    if (discrepancy <= 0.04 && amountSent >= 1 && senderRemainingBalance >= 100) { // 4% tolerance
-                        console.log("Transaction is a simple transfer of USDC");
-                        console.log(txInfo.transaction.signatures[0]);
-                        console.log(`USDC Transfer Details:`);
-                        console.log(`  From: ${sender}`);
-                        console.log(`  To: ${receiver}`);
-                        console.log(`  Amount Sent: ${amountSent.toFixed(6)} USDC`);
-                        console.log(`  Amount Received: ${amountReceived.toFixed(6)} USDC`);
-                        console.log(`  Sender's Remaining Balance: ${senderRemainingBalance.toFixed(6)} USDC`);
-                        console.log(`  Discrepancy: ${(discrepancy * 100).toFixed(2)}%`);
-                        console.log("calling poison endpoint on localhost:5001/poison")
-                        axios.post('http://127.0.0.1:5001/poison', {
-                            detectedsender: sender,
-                            detectedreceiver: receiver
-                        });
-                        //print all accountkeys in the transaction
-                        console.log(txInfo.transaction.message.accountKeys);
-                    }
-                } else {
-                    console.log("Could not identify proper sender/receiver pair");
-                }
-            }
-        }
-            // Log messages
-            //if (txInfo.meta.logMessages?.length > 0) {
-              //  console.log('\n=== Program Logs ===');
-             //   txInfo.meta.logMessages.forEach((log: string) => {
-            //        console.log(`  ${log}`);
-            //    });
-           // }
     }
 }
 
 // Start monitoring
-monitorTransactions().catch(console.error);
+startMonitoringWithRetry();

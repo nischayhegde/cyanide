@@ -17,13 +17,14 @@ from nacl.signing import SigningKey
 logging.basicConfig(level="INFO", format="[%(levelname)s %(asctime)s] %(message)s")
 
 
-def generate_similar_address(wallet_address: str, use_gpu_selection: bool = False) -> Dict[str, str]:
+def generate_similar_address(wallet_address: str, use_gpu_selection: bool = False, force_gpu_0: bool = False) -> Dict[str, str]:
     """
     Generate a new Solana address that starts with the same 4 characters as the input address.
     
     Args:
         wallet_address (str): The input wallet address to match the first 4 characters
         use_gpu_selection (bool): Whether to manually select GPU devices
+        force_gpu_0 (bool): If True, forces the use of GPU 0 (NVIDIA GPU)
         
     Returns:
         Dict[str, str]: Dictionary containing 'private_key_array', 'private_key_hex', 'public_key', etc.
@@ -39,7 +40,12 @@ def generate_similar_address(wallet_address: str, use_gpu_selection: bool = Fals
     
     # Set up devices
     chosen_devices: Optional[Tuple[int, List[int]]] = None
-    if use_gpu_selection:
+    if force_gpu_0:
+        # Force use of GPU 0 (typically NVIDIA)
+        chosen_devices = (0, [0])  # Platform 0, Device 0
+        gpu_counts = 1
+        logging.info("Forcing use of GPU 0 (NVIDIA GPU)")
+    elif use_gpu_selection:
         chosen_devices = get_chosen_devices()
         gpu_counts = len(chosen_devices[1])
     else:
@@ -101,9 +107,9 @@ def generate_similar_address(wallet_address: str, use_gpu_selection: bool = Fals
 if __name__ == "__main__":
     multiprocessing.set_start_method("spawn")
     
-    # Example usage
-    example_address = "v35g9os1e9qSs2u7TsThXqkBSRVFxhmYaFKFZ1waUdcQ"
-    result = generate_similar_address(example_address)
+    # Example usage - force use of GPU 0 (NVIDIA GPU)
+    example_address = "RAPELos1e9qSs2u7TsThXqkBSRVFxhmYaFKFZ1waUdcQ"
+    result = generate_similar_address(example_address, force_gpu_0=True)
     print(f"Original address: {example_address}")
     print(f"Generated keypair:")
     print(f"  Public key:  {result['public_key']}")
